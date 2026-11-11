@@ -69,6 +69,17 @@ class LoopTests(unittest.TestCase):
         truncated = final('partial')
         truncated['finish'] = 'length'
         self.assertEqual(run_agent('x', FakeProvider([truncated]), StatusTools())['status'], 'error')
+    def test_model_truncation_with_tool_call_stops_immediately(self):
+        truncated = tool_call('cut', 'get_status', '{"provider":"github"}')
+        truncated['finish'] = 'length'
+        fake = FakeProvider([truncated, final('must not be used')])
+        result = run_agent('x', fake, StatusTools())
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(len(fake.histories), 1)
+        self.assertTrue(any(
+            item['event'] == 'model_stopped' and item.get('finish') == 'length'
+            for item in result['trace']
+        ))
     def test_multiple_tool_calls(self):
         a = tool_call('a', 'get_status', '{"provider":"github"}')
         b = tool_call('b', 'get_status', '{"provider":"cloudflare"}')
