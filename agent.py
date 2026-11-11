@@ -13,6 +13,10 @@ INCIDENT_HOSTS = {
     'githubstatus.com': 'github',
     'cloudflarestatus.com': 'cloudflare',
 }
+QUESTION_INCIDENT_RE = re.compile(
+    r'\b(github|cloudflare|vercel|npm|digitalocean)\b[^.\n]{0,80}?\b([a-z0-9]{12})\b',
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Dùng tools trước khi khẳng định về trạng thái. Phân biệt incident hiện tại và lịch sử,
@@ -25,6 +29,11 @@ phạm vi provider, component, incident và nhóm khách hàng trong bằng ch�
 Nếu update có truncated=true hoặc updates_total lớn hơn số update được trả, phải nói rõ
 bằng chứng chưa đầy đủ và không tuyên bố đã biết toàn bộ nguyên nhân.
 Khi câu hỏi dùng một incident lịch sử để khẳng định trạng thái hiện tại, phải kiểm tra cả status hiện tại và chi tiết incident trước khi kết luận.'''
+
+TOOL_USE_POLICY = '''Quy tắc dùng tool bắt buộc:
+- Nếu tool trả RATE_LIMITED với retriable=true, tự thử lại ngay trong budget, tối đa 3 lần cho cùng kiểm tra; không hỏi người dùng có muốn retry không. Sau 3 lần thất bại, báo chưa xác minh được và dừng retry.
+- Khi status result chỉ ra incident và câu hỏi yêu cầu chi tiết, phạm vi hoặc so sánh incident mới nhất, phải gọi get_incident_details cho từng incident cần đối chiếu.
+- Khi timeline có next_offset và câu hỏi cần update ở trang sau, tiếp tục pagination bằng offset/limit hợp lệ; không nói đã đọc hết khi vẫn còn trang chưa đọc.'''
 
 
 def _related_incidents(tool_result):
@@ -40,15 +49,42 @@ def _related_incidents(tool_result):
 
 def run_agent(question, provider, tools, max_steps=6):
     """Trả dict: status, answer, trace, usage. Contract chi tiết trong GUIDE.md."""
+    active_schemas = getattr(tools, 'schemas', SCHEMAS)
+    active_system_prompt = getattr(tools, 'system_prompt', SYSTEM_PROMPT)
+    active_system_prompt = active_system_prompt + '\n' + TOOL_USE_POLICY
+    question_text = str(question)
+    supported_incident_providers = set()
+    for tool_schema in active_schemas:
+        function = tool_schema.get('function', {}) if isinstance(tool_schema, dict) else {}
+        if function.get('name') != 'get_incident_details':
+            continue
+        provider_schema = (
+            function.get('parameters', {}).get('properties', {}).get('provider', {})
+        )
+        supported_incident_providers.update(provider_schema.get('enum', []))
+    requested_incidents = {
+        (provider_name.casefold(), incident_id)
+        for provider_name, incident_id in QUESTION_INCIDENT_RE.findall(question_text)
+        if provider_name.casefold() in supported_incident_providers
+        and any(character.isdigit() for character in incident_id)
+    }
+    normalized_question = question_text.casefold()
+    requires_latest_incident_details = (
+        'incident' in normalized_question
+        and ('mới nhất' in normalized_question or 'latest' in normalized_question)
+    )
+    requires_full_timeline = 'timeline' in normalized_question
     messages = [
-        {'role': 'system', 'content': SYSTEM_PROMPT},
-        {'role': 'user', 'content': str(question)},
+        {'role': 'system', 'content': active_system_prompt},
+        {'role': 'user', 'content': question_text},
     ]
     trace = []
     usage = []
     observed_source_urls = []
     attempted_incidents = set()
     related_incidents = set()
+    retry_states = {}
+    pending_pages = {}
 
     def result(status, answer=''):
         return {'status': status, 'answer': answer, 'trace': trace, 'usage': usage}
@@ -58,7 +94,7 @@ def run_agent(question, provider, tools, max_steps=6):
 
     for step in range(1, max_steps + 1):
         try:
-            response = provider.complete(messages, SCHEMAS)
+            response = provider.complete(messages, active_schemas)
         except Exception as exc:
             trace.append({'event': 'provider_error', 'step': step, 'error': type(exc).__name__})
             return result('error')
@@ -113,9 +149,23 @@ def run_agent(question, provider, tools, max_steps=6):
                 'arguments': arguments if arguments is not None else raw_arguments,
                 'result': tool_result,
             })
+            if isinstance(arguments, dict) and isinstance(tool_result, dict):
+                retry_key = (name, json.dumps(arguments, ensure_ascii=False, sort_keys=True))
+                retry_state = retry_states.setdefault(retry_key, {
+                    'name': name,
+                    'arguments': arguments,
+                    'attempts': 0,
+                    'pending': False,
+                })
+                retry_state['attempts'] += 1
+                retry_state['pending'] = (
+                    tool_result.get('error') == 'RATE_LIMITED'
+                    and tool_result.get('retriable') is True
+                )
             if (isinstance(arguments, dict) and isinstance(tool_result, dict)
                     and isinstance(arguments.get('provider'), str)
-                    and (tool_result.get('ok') is False or tool_result.get('error'))):
+                    and (tool_result.get('ok') is False or tool_result.get('error'))
+                    and tool_result.get('error') != 'INVALID_ARGUMENTS'):
                 step_failures.append({
                     'tool': name,
                     'provider': arguments['provider'],
@@ -127,6 +177,17 @@ def run_agent(question, provider, tools, max_steps=6):
                     and tool_result.get('ok') and isinstance(tool_result.get('url'), str)):
                 observed_source_urls.append(tool_result['url'])
                 related_incidents.update(_related_incidents(tool_result))
+                incident_key = (arguments.get('provider'), arguments.get('incident_id'))
+                next_offset = tool_result.get('next_offset')
+                if isinstance(next_offset, int):
+                    pending_pages[incident_key] = {
+                        'provider': arguments.get('provider'),
+                        'incident_id': arguments.get('incident_id'),
+                        'offset': next_offset,
+                        'limit': arguments.get('limit', 2),
+                    }
+                else:
+                    pending_pages.pop(incident_key, None)
                 updates = tool_result.get('updates', [])
                 updates = updates if isinstance(updates, list) else []
                 updates_total = tool_result.get('updates_total')
@@ -145,6 +206,13 @@ def run_agent(question, provider, tools, max_steps=6):
                         'updates_total': updates_total,
                         'truncated': has_truncated,
                     })
+            if (requires_latest_incident_details and isinstance(tool_result, dict)
+                    and isinstance(tool_result.get('provider'), str)
+                    and isinstance(tool_result.get('incidents'), list)
+                    and tool_result['incidents']):
+                newest_incident = tool_result['incidents'][0]
+                if isinstance(newest_incident, dict) and isinstance(newest_incident.get('id'), str):
+                    related_incidents.add((tool_result['provider'], newest_incident['id']))
 
             messages.append({
                 'role': 'tool',
@@ -197,7 +265,31 @@ def run_agent(question, provider, tools, max_steps=6):
             continue
 
         if finish == 'stop':
-            unfollowed = sorted(related_incidents - attempted_incidents)
+            pending_retries = [
+                state for state in retry_states.values()
+                if state['pending'] and state['attempts'] < 3
+            ]
+            if pending_retries:
+                retry = pending_retries[0]
+                trace.append({
+                    'event': 'validation_retry_required',
+                    'step': step,
+                    'name': retry['name'],
+                    'arguments': retry['arguments'],
+                    'attempt': retry['attempts'],
+                    'max_attempts': 3,
+                })
+                messages.append({
+                    'role': 'user',
+                    'content': 'Tool trả RATE_LIMITED và cho phép retry. Hãy tự gọi lại '
+                               + retry['name']
+                               + ' với cùng tham số ngay bây giờ; không hỏi người dùng. '
+                                 'Tối đa 3 lần cho kiểm tra này.',
+                })
+                continue
+            unfollowed = sorted(
+                (related_incidents | requested_incidents) - attempted_incidents
+            )
             if unfollowed:
                 incidents = [
                     {'provider': provider_name, 'incident_id': incident_id}
@@ -215,6 +307,23 @@ def run_agent(question, provider, tools, max_steps=6):
                     'role': 'user',
                     'content': 'Trước khi trả lời, hãy gọi get_incident_details cho các '
                                'incident liên quan chưa đọc: ' + requests + '.',
+                })
+                continue
+            if requires_full_timeline and pending_pages:
+                page = sorted(
+                    pending_pages.values(),
+                    key=lambda item: (item['provider'], item['incident_id']),
+                )[0]
+                trace.append({
+                    'event': 'validation_pagination_required',
+                    'step': step,
+                    **page,
+                })
+                messages.append({
+                    'role': 'user',
+                    'content': 'Timeline vẫn còn trang chưa đọc. Hãy gọi get_incident_details '
+                               f"cho {page['provider']}:{page['incident_id']} với "
+                               f"offset={page['offset']} và limit={page['limit']} trước khi trả lời.",
                 })
                 continue
             missing_sources = [url for url in observed_source_urls if url not in answer]
