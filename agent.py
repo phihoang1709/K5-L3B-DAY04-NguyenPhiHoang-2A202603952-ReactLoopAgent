@@ -17,6 +17,10 @@ QUESTION_INCIDENT_RE = re.compile(
     r'\b(github|cloudflare|vercel|npm|digitalocean)\b[^.\n]{0,80}?\b([a-z0-9]{12})\b',
     re.IGNORECASE,
 )
+REVERSED_QUESTION_INCIDENT_RE = re.compile(
+    r'\b([a-z0-9]{12})\b[^.\n]{0,80}?\b(github|cloudflare|vercel|npm|digitalocean)\b',
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Dùng tools trước khi khẳng định về trạng thái. Phân biệt incident hiện tại và lịch sử,
@@ -31,9 +35,10 @@ bằng chứng chưa đầy đủ và không tuyên bố đã biết toàn bộ 
 Khi câu hỏi dùng một incident lịch sử để khẳng định trạng thái hiện tại, phải kiểm tra cả status hiện tại và chi tiết incident trước khi kết luận.'''
 
 TOOL_USE_POLICY = '''Quy tắc dùng tool bắt buộc:
-- Nếu tool trả RATE_LIMITED với retriable=true, tự thử lại ngay trong budget, tối đa 3 lần cho cùng kiểm tra; không hỏi người dùng có muốn retry không. Sau 3 lần thất bại, báo chưa xác minh được và dừng retry.
+- Nếu tool trả RATE_LIMITED với retriable=true và Retry-After không có hoặc bằng 0, tự thử lại trong budget, tối đa 3 lần cho cùng kiểm tra; không hỏi người dùng. Nếu Retry-After dương/không đọc được hoặc đã đủ 3 lần, dừng retry và báo chưa xác minh được.
 - Khi status result chỉ ra incident và câu hỏi yêu cầu chi tiết, phạm vi hoặc so sánh incident mới nhất, phải gọi get_incident_details cho từng incident cần đối chiếu.
-- Khi timeline có next_offset và câu hỏi cần update ở trang sau, tiếp tục pagination bằng offset/limit hợp lệ; không nói đã đọc hết khi vẫn còn trang chưa đọc.'''
+- Khi timeline có next_offset và câu hỏi cần update ở trang sau, tiếp tục pagination bằng đúng next_offset/limit; chỉ đọc toàn bộ các trang khi người dùng yêu cầu rõ đọc hết timeline.
+- Nếu người dùng chỉ hỏi provider không được tools hỗ trợ, báo thiếu tool; không gọi provider khác vì chúng không chứng minh trạng thái provider được hỏi.'''
 
 
 def _related_incidents(tool_result):
@@ -68,12 +73,22 @@ def run_agent(question, provider, tools, max_steps=6):
         if provider_name.casefold() in supported_incident_providers
         and any(character.isdigit() for character in incident_id)
     }
+    requested_incidents.update({
+        (provider_name.casefold(), incident_id)
+        for incident_id, provider_name in REVERSED_QUESTION_INCIDENT_RE.findall(question_text)
+        if provider_name.casefold() in supported_incident_providers
+        and any(character.isdigit() for character in incident_id)
+    })
     normalized_question = question_text.casefold()
     requires_latest_incident_details = (
         'incident' in normalized_question
         and ('mới nhất' in normalized_question or 'latest' in normalized_question)
     )
-    requires_full_timeline = 'timeline' in normalized_question
+    timeline_requested = 'timeline' in normalized_question
+    requires_full_timeline = any(
+        phrase in normalized_question
+        for phrase in ('toàn bộ timeline', 'đọc hết timeline', 'entire timeline')
+    )
     messages = [
         {'role': 'system', 'content': active_system_prompt},
         {'role': 'user', 'content': question_text},
@@ -82,9 +97,13 @@ def run_agent(question, provider, tools, max_steps=6):
     usage = []
     observed_source_urls = []
     attempted_incidents = set()
+    successful_incidents = set()
+    terminal_failed_incidents = set()
     related_incidents = set()
+    required_detail_incidents = set(requested_incidents)
     retry_states = {}
     pending_pages = {}
+    valid_pages_read = {}
 
     def result(status, answer=''):
         return {'status': status, 'answer': answer, 'trace': trace, 'usage': usage}
@@ -126,16 +145,26 @@ def run_agent(question, provider, tools, max_steps=6):
             call_id = call.get('id')
             name = call.get('name')
             raw_arguments = call.get('arguments', '')
+            retry_key = None
+            retry_blocked = False
             try:
                 arguments = json.loads(raw_arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError('Tool arguments must be a JSON object')
-                if name == 'get_incident_details':
-                    provider_name = arguments.get('provider')
-                    incident_id = arguments.get('incident_id')
-                    if isinstance(provider_name, str) and isinstance(incident_id, str):
-                        attempted_incidents.add((provider_name, incident_id))
-                tool_result = tools.execute(name, arguments)
+                retry_key = (
+                    name,
+                    json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+                )
+                retry_state = retry_states.get(retry_key)
+                if retry_state and retry_state.get('block_future'):
+                    retry_blocked = True
+                    tool_result = {
+                        'ok': False,
+                        'error': 'RETRY_LIMIT_REACHED',
+                        'message': retry_state['block_reason'],
+                    }
+                else:
+                    tool_result = tools.execute(name, arguments)
             except (json.JSONDecodeError, TypeError, ValueError):
                 arguments = None
                 tool_result = {'ok': False, 'error': 'INVALID_ARGUMENTS'}
@@ -143,25 +172,46 @@ def run_agent(question, provider, tools, max_steps=6):
                 tool_result = {'ok': False, 'error': type(exc).__name__}
 
             trace.append({
-                'event': 'tool',
+                'event': 'retry_blocked' if retry_blocked else 'tool',
                 'step': step,
                 'name': name,
                 'arguments': arguments if arguments is not None else raw_arguments,
                 'result': tool_result,
             })
-            if isinstance(arguments, dict) and isinstance(tool_result, dict):
-                retry_key = (name, json.dumps(arguments, ensure_ascii=False, sort_keys=True))
+            if (not retry_blocked and retry_key is not None
+                    and isinstance(tool_result, dict)):
                 retry_state = retry_states.setdefault(retry_key, {
                     'name': name,
                     'arguments': arguments,
                     'attempts': 0,
                     'pending': False,
+                    'block_future': False,
+                    'block_reason': '',
                 })
                 retry_state['attempts'] += 1
-                retry_state['pending'] = (
+                rate_limited = (
                     tool_result.get('error') == 'RATE_LIMITED'
                     and tool_result.get('retriable') is True
                 )
+                retry_after = tool_result.get(
+                    'retry_after_seconds', tool_result.get('retry_after')
+                )
+                try:
+                    retry_delay_positive = float(retry_after) > 0
+                except (TypeError, ValueError):
+                    retry_delay_positive = retry_after not in (None, '', 0, '0')
+                retry_state['pending'] = rate_limited and not retry_delay_positive
+                if rate_limited and retry_delay_positive:
+                    retry_state['block_future'] = True
+                    retry_state['block_reason'] = (
+                        f'Không retry ngay vì Retry-After={retry_after}.'
+                    )
+                elif rate_limited and retry_state['attempts'] >= 3:
+                    retry_state['block_future'] = True
+                    retry_state['block_reason'] = 'Đã đạt giới hạn 3 lần gọi.'
+                elif not rate_limited:
+                    retry_state['pending'] = False
+                    retry_state['block_future'] = False
             if (isinstance(arguments, dict) and isinstance(tool_result, dict)
                     and isinstance(arguments.get('provider'), str)
                     and (tool_result.get('ok') is False or tool_result.get('error'))
@@ -173,21 +223,55 @@ def run_agent(question, provider, tools, max_steps=6):
                     'incident_id': arguments.get('incident_id'),
                     'error': tool_result.get('error', 'TOOL_ERROR'),
                 })
+            if name == 'get_incident_details' and isinstance(arguments, dict):
+                incident_key = (arguments.get('provider'), arguments.get('incident_id'))
+                if all(isinstance(value, str) for value in incident_key):
+                    attempted_incidents.add(incident_key)
+                    if isinstance(tool_result, dict) and tool_result.get('ok') is True:
+                        successful_incidents.add(incident_key)
+                    elif isinstance(tool_result, dict):
+                        incident_error = tool_result.get('error')
+                        state = retry_states.get(retry_key) if retry_key else None
+                        if (incident_error not in ('INVALID_ARGUMENTS', 'RATE_LIMITED')
+                                or (state and state.get('block_future'))):
+                            terminal_failed_incidents.add(incident_key)
             if (name == 'get_incident_details' and isinstance(tool_result, dict)
                     and tool_result.get('ok') and isinstance(tool_result.get('url'), str)):
                 observed_source_urls.append(tool_result['url'])
                 related_incidents.update(_related_incidents(tool_result))
                 incident_key = (arguments.get('provider'), arguments.get('incident_id'))
-                next_offset = tool_result.get('next_offset')
-                if isinstance(next_offset, int):
-                    pending_pages[incident_key] = {
-                        'provider': arguments.get('provider'),
-                        'incident_id': arguments.get('incident_id'),
-                        'offset': next_offset,
-                        'limit': arguments.get('limit', 2),
-                    }
-                else:
-                    pending_pages.pop(incident_key, None)
+                if timeline_requested and incident_key in requested_incidents:
+                    called_offset = arguments.get('offset', 0)
+                    expected_page = pending_pages.get(incident_key)
+                    expected_offset = (
+                        expected_page.get('offset') if expected_page else None
+                    )
+                    page_in_sequence = (
+                        expected_offset is None or called_offset == expected_offset
+                    )
+                    if not page_in_sequence:
+                        trace.append({
+                            'event': 'pagination_offset_mismatch',
+                            'step': step,
+                            'provider': incident_key[0],
+                            'incident_id': incident_key[1],
+                            'expected_offset': expected_offset,
+                            'received_offset': called_offset,
+                        })
+                    else:
+                        valid_pages_read[incident_key] = (
+                            valid_pages_read.get(incident_key, 0) + 1
+                        )
+                        next_offset = tool_result.get('next_offset')
+                        if isinstance(next_offset, int):
+                            pending_pages[incident_key] = {
+                                'provider': arguments.get('provider'),
+                                'incident_id': arguments.get('incident_id'),
+                                'offset': next_offset,
+                                'limit': arguments.get('limit', 2),
+                            }
+                        else:
+                            pending_pages.pop(incident_key, None)
                 updates = tool_result.get('updates', [])
                 updates = updates if isinstance(updates, list) else []
                 updates_total = tool_result.get('updates_total')
@@ -212,7 +296,9 @@ def run_agent(question, provider, tools, max_steps=6):
                     and tool_result['incidents']):
                 newest_incident = tool_result['incidents'][0]
                 if isinstance(newest_incident, dict) and isinstance(newest_incident.get('id'), str):
-                    related_incidents.add((tool_result['provider'], newest_incident['id']))
+                    required_detail_incidents.add(
+                        (tool_result['provider'], newest_incident['id'])
+                    )
 
             messages.append({
                 'role': 'tool',
@@ -267,7 +353,8 @@ def run_agent(question, provider, tools, max_steps=6):
         if finish == 'stop':
             pending_retries = [
                 state for state in retry_states.values()
-                if state['pending'] and state['attempts'] < 3
+                if (state['pending'] and state['attempts'] < 3
+                    and not state['block_future'])
             ]
             if pending_retries:
                 retry = pending_retries[0]
@@ -287,9 +374,11 @@ def run_agent(question, provider, tools, max_steps=6):
                                  'Tối đa 3 lần cho kiểm tra này.',
                 })
                 continue
-            unfollowed = sorted(
-                (related_incidents | requested_incidents) - attempted_incidents
+            unfollowed_related = related_incidents - attempted_incidents
+            unresolved_required = required_detail_incidents - (
+                successful_incidents | terminal_failed_incidents
             )
+            unfollowed = sorted(unfollowed_related | unresolved_required)
             if unfollowed:
                 incidents = [
                     {'provider': provider_name, 'incident_id': incident_id}
@@ -309,9 +398,14 @@ def run_agent(question, provider, tools, max_steps=6):
                                'incident liên quan chưa đọc: ' + requests + '.',
                 })
                 continue
-            if requires_full_timeline and pending_pages:
+            required_pages = [
+                page for incident_key, page in pending_pages.items()
+                if (requires_full_timeline
+                    or valid_pages_read.get(incident_key, 0) < 2)
+            ]
+            if timeline_requested and required_pages:
                 page = sorted(
-                    pending_pages.values(),
+                    required_pages,
                     key=lambda item: (item['provider'], item['incident_id']),
                 )[0]
                 trace.append({

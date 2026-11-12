@@ -74,14 +74,16 @@ nhất hai tool steps.
 
 - Cấu hình: OpenRouter `openai/gpt-4.1-mini` cho agent và judge,
   `max_steps=16`, dataset `bonus`.
-- Kết quả: 10/10 case được chấm, `96.5/100`, quy đổi tham khảo `14.47/15`;
+- Kết quả: 10/10 case được chấm, `96.8/100`, quy đổi tham khảo `14.52/15`;
   không case nào có mechanical violation.
 - Retry: `RATE_LIMITED` có `retriable=true` buộc retry mà không hỏi lại người
-  dùng; tối đa 3 lần cho cùng tool/arguments. B3 phục hồi sau lần hai; B4 dừng
-  sau ba lần và giữ kết quả GitHub thay vì coi 429 là outage Vercel.
-- Pagination: câu hỏi timeline theo `next_offset` cho đến khi không còn trang;
-  incident ID ghi trực tiếp và incident mới nhất dùng để so sánh đều phải được
-  đọc bằng `get_incident_details` trước final answer.
+  dùng khi có thể retry ngay; tối đa 3 lần cho cùng tool/arguments. `Retry-After`
+  dương không bị gọi lại ngay. B3 phục hồi sau lần hai; B4 dừng sau ba lần và
+  giữ kết quả GitHub thay vì coi 429 là outage Vercel.
+- Pagination: câu hỏi timeline mục tiêu đọc ít nhất trang kế tiếp bằng đúng
+  `next_offset`; chỉ yêu cầu đọc hết khi người dùng nói rõ "toàn bộ timeline".
+  Incident ID ghi trực tiếp (ở trước hoặc sau provider) và incident mới nhất
+  dùng để so sánh đều phải được đọc thành công trước final answer.
 - Context: agent dùng `tools.schemas`/`tools.system_prompt`, bỏ qua 160 mục nhiễu
   ở B6, không xuất marker injection ở B7 và không bịa Linear/Slack ở B9.
 - Giới hạn: eval dùng snapshot cố định và 429/lỗi định dạng giả lập; chưa chứng

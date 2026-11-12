@@ -94,6 +94,47 @@ class BonusAgentTests(unittest.TestCase):
             x['event']=='validation_retry_required' for x in result['trace']
         ),2)
 
+    def test_fourth_rate_limited_call_is_blocked_before_tool_execution(self):
+        t=BonusTools(scenario='rate_limit_always')
+        p=ScriptedProvider([
+            call('a','get_vercel_status',{}),
+            call('b','get_vercel_status',{}),
+            call('c','get_vercel_status',{}),
+            call('d','get_vercel_status',{}),
+            final('Không thể xác minh sau 3 lần.'),
+        ])
+
+        result=run_agent('Kiểm tra Vercel, tối đa 3 lần',p,t,max_steps=6)
+
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(t.calls[('get_vercel_status','vercel')],3)
+        self.assertEqual(sum(x['event']=='tool' for x in result['trace']),3)
+        self.assertTrue(any(x['event']=='retry_blocked' for x in result['trace']))
+
+    def test_positive_retry_after_blocks_immediate_retry(self):
+        class DelayedRateLimitTools(BonusTools):
+            def __init__(self):
+                super().__init__();self.executions=0
+            def execute(self,name,args):
+                self.executions+=1
+                return {'ok':False,'error':'RATE_LIMITED','http_status':429,
+                        'retry_after':'60','retriable':True}
+
+        t=DelayedRateLimitTools()
+        p=ScriptedProvider([
+            call('a','get_vercel_status',{}),
+            call('b','get_vercel_status',{}),
+            final('Chưa thể xác minh do Retry-After 60 giây.'),
+        ])
+
+        result=run_agent('Kiểm tra Vercel',p,t,max_steps=5)
+
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(t.executions,1)
+        self.assertFalse(any(
+            x['event']=='validation_retry_required' for x in result['trace']
+        ))
+
     def test_explicit_incident_id_must_be_read_before_final(self):
         t=BonusTools()
         details=t.execute('get_incident_details',{
@@ -113,6 +154,42 @@ class BonusAgentTests(unittest.TestCase):
         self.assertTrue(any(
             x['event']=='validation_unfollowed_incident' for x in result['trace']
         ))
+
+    def test_reversed_incident_provider_order_must_be_read(self):
+        t=BonusTools()
+        details=t.execute('get_incident_details',{
+            'provider':'vercel','incident_id':'w661l7k3kf4p'
+        })
+        p=ScriptedProvider([
+            final('Chưa đọc incident.'),
+            call('a','get_incident_details',{
+                'provider':'vercel','incident_id':'w661l7k3kf4p'
+            }),
+            final('Đã đọc incident. Nguồn: '+details['url']),
+        ])
+
+        result=run_agent('Incident w661l7k3kf4p của Vercel',p,t,max_steps=5)
+
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(sum(x['event']=='tool' for x in result['trace']),1)
+
+    def test_invalid_arguments_do_not_satisfy_explicit_incident_gate(self):
+        t=BonusTools(scenario='format_once')
+        url=BonusTools().execute('get_incident_details',{
+            'provider':'npm','incident_id':'cc0t2r4403sy'
+        })['url']
+        args={'provider':'npm','incident_id':'cc0t2r4403sy','offset':0}
+        p=ScriptedProvider([
+            call('a','get_incident_details',args),
+            final('Chưa đọc được incident.'),
+            call('b','get_incident_details',args),
+            final('Đã đọc incident. Nguồn: '+url),
+        ])
+
+        result=run_agent('Kiểm tra npm incident cc0t2r4403sy',p,t,max_steps=6)
+
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(sum(x['event']=='tool' for x in result['trace']),2)
 
     def test_latest_incident_from_status_must_be_read(self):
         t=BonusTools()
@@ -158,7 +235,7 @@ class BonusAgentTests(unittest.TestCase):
             final('Đã đọc toàn bộ timeline. Nguồn: '+details['url']),
         ])
 
-        result=run_agent('Tra timeline npm incident cc0t2r4403sy',p,t,max_steps=8)
+        result=run_agent('Đọc toàn bộ timeline npm incident cc0t2r4403sy',p,t,max_steps=8)
 
         self.assertEqual(result['status'],'completed')
         offsets=[x['arguments'].get('offset',0) for x in result['trace']
@@ -168,5 +245,67 @@ class BonusAgentTests(unittest.TestCase):
         self.assertEqual(sum(
             x['event']=='validation_pagination_required' for x in result['trace']
         ),2)
+
+    def test_skipped_pagination_offset_keeps_expected_page_pending(self):
+        t=BonusTools();incident_id='cc0t2r4403sy'
+        url=t.execute('get_incident_details',{
+            'provider':'npm','incident_id':incident_id,'offset':0,'limit':1
+        })['url']
+        p=ScriptedProvider([
+            call('a','get_incident_details',{
+                'provider':'npm','incident_id':incident_id,'offset':0,'limit':1
+            }), final('Nguồn: '+url),
+            call('b','get_incident_details',{
+                'provider':'npm','incident_id':incident_id,'offset':2,'limit':1
+            }), final('Nguồn: '+url),
+            call('c','get_incident_details',{
+                'provider':'npm','incident_id':incident_id,'offset':1,'limit':1
+            }), final('Nguồn: '+url),
+            call('d','get_incident_details',{
+                'provider':'npm','incident_id':incident_id,'offset':2,'limit':1
+            }), final('Nguồn: '+url),
+        ])
+
+        result=run_agent(
+            'Đọc toàn bộ timeline npm incident cc0t2r4403sy',p,t,max_steps=10
+        )
+
+        self.assertEqual(result['status'],'completed')
+        offsets=[x['arguments'].get('offset',0) for x in result['trace']
+                 if x['event']=='tool' and x['name']=='get_incident_details']
+        self.assertEqual(offsets,[0,2,1,2])
+
+    def test_targeted_timeline_reads_only_the_next_required_page(self):
+        t=BonusTools();incident_id='sps6n39gm4sg'
+        first=t.execute('get_incident_details',{
+            'provider':'vercel','incident_id':incident_id,'offset':0,'limit':3
+        })
+        github=t.execute('get_incident_details',{
+            'provider':'github','incident_id':'93njd414rpbx','offset':0,'limit':3
+        })
+        p=ScriptedProvider([
+            call('a','get_incident_details',{
+                'provider':'vercel','incident_id':incident_id,'offset':0,'limit':3
+            }), final('Nguồn: '+first['url']),
+            call('b','get_incident_details',{
+                'provider':'vercel','incident_id':incident_id,'offset':3,'limit':3
+            }), final('Đã tìm thấy thông báo. Nguồn: '+first['url']),
+            call('c','get_incident_details',{
+                'provider':'github','incident_id':'93njd414rpbx',
+                'offset':0,'limit':3
+            }),
+            final('Nguồn: '+first['url']+' '+github['url']),
+        ])
+
+        result=run_agent(
+            'Tra timeline Vercel incident sps6n39gm4sg để tìm thông báo upstream',
+            p,t,max_steps=6,
+        )
+
+        self.assertEqual(result['status'],'completed')
+        offsets=[x['arguments'].get('offset',0) for x in result['trace']
+                 if x['event']=='tool' and x['name']=='get_incident_details'
+                 and x['arguments']['provider']=='vercel']
+        self.assertEqual(offsets,[0,3])
 
 if __name__=='__main__': unittest.main()
