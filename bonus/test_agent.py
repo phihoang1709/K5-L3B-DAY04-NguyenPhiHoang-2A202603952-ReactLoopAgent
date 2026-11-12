@@ -215,36 +215,41 @@ class BonusAgentTests(unittest.TestCase):
         self.assertEqual(detail_calls[0]['arguments']['incident_id'],incident_id)
 
     def test_timeline_question_follows_all_next_offsets(self):
-        t=BonusTools()
-        incident_id='cc0t2r4403sy'
-        details=t.execute('get_incident_details',{
-            'provider':'npm','incident_id':incident_id,'offset':0,'limit':1
-        })
-        p=ScriptedProvider([
-            call('a','get_incident_details',{
-                'provider':'npm','incident_id':incident_id,'offset':0,'limit':1
-            }),
-            final('Đã đọc timeline. Nguồn: '+details['url']),
-            call('b','get_incident_details',{
-                'provider':'npm','incident_id':incident_id,'offset':1,'limit':1
-            }),
-            final('Đã đọc timeline. Nguồn: '+details['url']),
-            call('c','get_incident_details',{
-                'provider':'npm','incident_id':incident_id,'offset':2,'limit':1
-            }),
-            final('Đã đọc toàn bộ timeline. Nguồn: '+details['url']),
-        ])
+        questions=[
+            'Đọc toàn bộ timeline npm incident cc0t2r4403sy',
+            'Đọc timeline đầy đủ npm incident cc0t2r4403sy',
+            'Read the entire timeline for npm incident cc0t2r4403sy',
+            'Read the full timeline for npm incident cc0t2r4403sy',
+        ]
+        for question in questions:
+            with self.subTest(question=question):
+                t=BonusTools();incident_id='cc0t2r4403sy'
+                details=t.execute('get_incident_details',{
+                    'provider':'npm','incident_id':incident_id,'offset':0,'limit':1
+                })
+                p=ScriptedProvider([
+                    call('a','get_incident_details',{
+                        'provider':'npm','incident_id':incident_id,'offset':0,'limit':1
+                    }), final('Đã đọc timeline. Nguồn: '+details['url']),
+                    call('b','get_incident_details',{
+                        'provider':'npm','incident_id':incident_id,'offset':1,'limit':1
+                    }), final('Đã đọc timeline. Nguồn: '+details['url']),
+                    call('c','get_incident_details',{
+                        'provider':'npm','incident_id':incident_id,'offset':2,'limit':1
+                    }), final('Đã đọc toàn bộ timeline. Nguồn: '+details['url']),
+                ])
 
-        result=run_agent('Đọc toàn bộ timeline npm incident cc0t2r4403sy',p,t,max_steps=8)
+                result=run_agent(question,p,t,max_steps=8)
 
-        self.assertEqual(result['status'],'completed')
-        offsets=[x['arguments'].get('offset',0) for x in result['trace']
-                 if x['event']=='tool' and x['name']=='get_incident_details'
-                 and x['arguments']['provider']=='npm']
-        self.assertEqual(offsets,[0,1,2])
-        self.assertEqual(sum(
-            x['event']=='validation_pagination_required' for x in result['trace']
-        ),2)
+                self.assertEqual(result['status'],'completed')
+                offsets=[x['arguments'].get('offset',0) for x in result['trace']
+                         if x['event']=='tool' and x['name']=='get_incident_details'
+                         and x['arguments']['provider']=='npm']
+                self.assertEqual(offsets,[0,1,2])
+                self.assertEqual(sum(
+                    x['event']=='validation_pagination_required'
+                    for x in result['trace']
+                ),2)
 
     def test_skipped_pagination_offset_keeps_expected_page_pending(self):
         t=BonusTools();incident_id='cc0t2r4403sy'

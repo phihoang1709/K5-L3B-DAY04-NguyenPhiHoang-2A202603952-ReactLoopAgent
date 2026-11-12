@@ -21,6 +21,11 @@ REVERSED_QUESTION_INCIDENT_RE = re.compile(
     r'\b([a-z0-9]{12})\b[^.\n]{0,80}?\b(github|cloudflare|vercel|npm|digitalocean)\b',
     re.IGNORECASE,
 )
+FULL_TIMELINE_RE = re.compile(
+    r'(?:toàn bộ|đầy đủ|hết|entire|full|complete)\s+timeline'
+    r'|timeline\s+(?:toàn bộ|đầy đủ|in full|complete)',
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Dùng tools trước khi khẳng định về trạng thái. Phân biệt incident hiện tại và lịch sử,
@@ -85,10 +90,7 @@ def run_agent(question, provider, tools, max_steps=6):
         and ('mới nhất' in normalized_question or 'latest' in normalized_question)
     )
     timeline_requested = 'timeline' in normalized_question
-    requires_full_timeline = any(
-        phrase in normalized_question
-        for phrase in ('toàn bộ timeline', 'đọc hết timeline', 'entire timeline')
-    )
+    requires_full_timeline = bool(FULL_TIMELINE_RE.search(normalized_question))
     messages = [
         {'role': 'system', 'content': active_system_prompt},
         {'role': 'user', 'content': question_text},
